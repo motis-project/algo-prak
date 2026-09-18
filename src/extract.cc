@@ -596,7 +596,7 @@ void extract(bool const with_platforms,
     pl = std::make_unique<platforms>(out, cista::mmap::protection::WRITE);
   }
 
-  w.node_way_counter_.reserve(12000000000);
+  w.node_way_counter_.reserve(12000U);
   {  // Collect node coordinates.
     pt->status("Load OSM / Coordinates").in_high(file_size).out_bounds(0, 15);
 

@@ -176,6 +176,20 @@ struct level_t {
 
   constexpr cista::hash_t hash() const { return v_; }
 
+  template <std::size_t NMaxTypes>
+  friend constexpr auto static_type_hash(
+      level_t const*, cista::hash_data<NMaxTypes> h) noexcept {
+    using cista::static_type_hash;
+    h = h.combine(cista::hash("level_t v1.0"));
+    return h;
+  }
+
+  template <typename Ctx>
+  friend void serialize(Ctx&, level_t const*, cista::offset_t) {}
+
+  template <typename Ctx>
+  friend void deserialize(Ctx const&, level_t*) {}
+
   std::uint8_t v_;
 };
 

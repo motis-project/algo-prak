@@ -288,7 +288,7 @@ int main(int argc, char const* argv[]) {
             if (!utl::any_of(ends, [&](auto&& e) {
                   auto const it = d.cost_.find(e.get_node().get_key());
                   auto const d_res = d.get_cost(e.get_node());
-                  std::cout << " " << d_res << " vs " << b_res << std::endl;
+                  // std::cout << " " << d_res << " vs " << b_res << std::endl;
                   return b_res == d_res;
                 })) {
 

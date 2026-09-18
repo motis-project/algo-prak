@@ -25,6 +25,9 @@ struct dijkstra;
 template <Profile>
 struct bidirectional;
 
+template <Profile>
+struct cch_query;
+
 struct sharing_data;
 
 template <Profile P>
@@ -32,6 +35,23 @@ bidirectional<P>& get_bidirectional();
 
 template <Profile P>
 dijkstra<P, false>& get_dijkstra();
+
+template <Profile P>
+cch_query<P>& get_cch_query(std::filesystem::path const&);
+
+std::optional<path> route_cch_car(car::parameters const& params,
+                                  ways const& w,
+                                  lookup const& l,
+                                  cch_query<car>& cch_q,
+                                  location const& from,
+                                  location const& to,
+                                  match_view_t from_match,
+                                  match_view_t to_match,
+                                  cost_t const max,
+                                  direction const dir,
+                                  bitvec<node_idx_t> const* blocked,
+                                  sharing_data const* sharing,
+                                  elevation_storage const* elevations);
 
 std::vector<std::optional<path>> route(
     profile_parameters const&,

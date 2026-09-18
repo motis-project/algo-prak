@@ -117,6 +117,7 @@ add_library(osr ${osr-src})
 target_include_directories(osr PUBLIC include)
 target_compile_features(osr PUBLIC cxx_std_23)
 target_compile_options(osr PRIVATE ${osr-compile-options})
+target_compile_definitions(osr PUBLIC "OSR_DEBUG=$<CONFIG:Debug>")
 target_link_libraries(osr
         osmium
         zlibstatic
@@ -137,8 +138,14 @@ target_link_libraries(osr
 add_executable(osr-extract exe/extract.cc)
 target_link_libraries(osr-extract osr)
 
+add_executable(osr-cch-preprocess exe/cch_preprocess.cc)
+target_link_libraries(osr-cch-preprocess osr)
+
 add_executable(osr-benchmark exe/benchmark.cc)
 target_link_libraries(osr-benchmark osr)
+
+add_executable(osr-benchmark-cch exe/benchmark_cch.cc)
+target_link_libraries(osr-benchmark-cch osr)
 
 file(GLOB_RECURSE osr-backend-src exe/backend/*.cc)
 add_executable(osr-backend ${osr-backend-src})
