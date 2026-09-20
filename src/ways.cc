@@ -1,4 +1,5 @@
 #include "osr/ways.h"
+#include "osr/routing/cch.h"
 
 #include <algorithm>
 
@@ -7,8 +8,7 @@
 
 #include "cista/io.h"
 
-// uncomment the following line to enable IFC
-// #define USE_INERTIAL_FLOW_CUT
+#define USE_INERTIAL_FLOW_CUT
 #ifdef USE_INERTIAL_FLOW_CUT
 #include "inertialflowcutter/run.h"
 #endif
@@ -61,6 +61,7 @@ ways::ways(std::filesystem::path p, cista::mmap::protection const mode)
       r_{mode == cista::mmap::protection::READ
              ? routing::read(p_)
              : cista::wrapped<routing>{cista::raw::make_unique<routing>()}},
+      cch_{std::make_unique<cch::cache>()},
       node_to_osm_{mm("node_to_osm.bin")},
       way_osm_idx_{mm("way_osm_idx.bin")},
       way_polylines_{mm_vec<point>{mm("way_polylines_data.bin")},
@@ -73,6 +74,10 @@ ways::ways(std::filesystem::path p, cista::mmap::protection const mode)
       way_has_conditional_access_no_{
           mm_vec<std::uint64_t>(mm("way_has_conditional_access_no"))},
       way_conditional_access_no_{mm("way_conditional_access_no")} {}
+
+ways::~ways() = default;
+ways::ways(ways&&) noexcept = default;
+ways& ways::operator=(ways&&) noexcept = default;
 
 void ways::build_components_and_importance() {
   r_->node_importance_.resize(n_nodes());
