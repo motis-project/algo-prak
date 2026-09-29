@@ -5,6 +5,7 @@
 #endif
 
 #include "osr/extract/extract.h"
+#include "osr/routing/cch.h"
 
 #include "boost/thread/tss.hpp"
 
@@ -691,6 +692,7 @@ void extract(bool const with_platforms,
 
   pt->status("Big Street Neighbors").in_high(w.n_ways()).out_bounds(95, 99);
   w.compute_big_street_neighbors();
+  cch::preprocess(*w.r_, out);
   w.r_->write(out);
 
   pt->status("Build R-Tree").in_high(1).out_bounds(99, 100);

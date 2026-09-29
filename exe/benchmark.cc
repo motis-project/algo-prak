@@ -22,6 +22,7 @@
 #include "osr/location.h"
 #include "osr/lookup.h"
 #include "osr/routing/bidirectional.h"
+#include "osr/routing/cch.h"
 #include "osr/routing/dijkstra.h"
 #include "osr/routing/profile.h"
 #include "osr/routing/profiles/car.h"
@@ -41,6 +42,7 @@ public:
     param(n_queries_, ",n", "Number of queries");
     param(max_dist_, "radius,r", "Radius");
     param(from_coords_, "matching,m", "Include node matching to coords");
+    param(cch_, "cch", "Benchmark node-pinned CCH routing with reconstruction");
     param(speed_, "speed,s", "Walking speed");
     param(mem_usage_, "mem", "Track memory usage");
   }
@@ -49,6 +51,7 @@ public:
   unsigned n_queries_{50};
   unsigned max_dist_{32768};
   bool from_coords_{false};
+  bool cch_{false};
   unsigned threads_{std::thread::hardware_concurrency()};
   float speed_{1.2F};
   bool mem_usage_{false};
@@ -57,16 +60,15 @@ public:
 struct benchmark_result {
   friend std::ostream& operator<<(std::ostream& out,
                                   benchmark_result const& br) {
-    using double_milliseconds_t =
-        std::chrono::duration<double, std::ratio<1, 1000>>;
+    using double_microseconds_t = std::chrono::duration<double, std::micro>;
     out << "(duration: " << std::fixed << std::setprecision(3) << std::setw(10)
-        << std::chrono::duration_cast<double_milliseconds_t>(br.duration_)
+        << std::chrono::duration_cast<double_microseconds_t>(br.duration_)
                .count()
-        << "ms)";
+        << "us)";
     return out;
   }
 
-  std::chrono::microseconds duration_;
+  std::chrono::nanoseconds duration_;
 };
 
 // needs sorted vector
@@ -80,8 +82,11 @@ benchmark_result quantile(std::vector<benchmark_result> const& v, double q) {
 
 void print_result(std::vector<benchmark_result> const& var,
                   std::string const& profile) {
+  if (var.empty()) {
+    return;
+  }
   auto const avg = benchmark_result{
-      std::accumulate(var.begin(), var.end(), std::chrono::microseconds{0U},
+      std::accumulate(var.begin(), var.end(), std::chrono::nanoseconds{0U},
                       [](auto&& sum, auto const& res) {
                         return std::move(sum) + res.duration_;
                       }) /
@@ -97,6 +102,7 @@ void print_result(std::vector<benchmark_result> const& var,
             << "\n  70%: " << quantile(var, 0.7)
             << "\n  80%: " << quantile(var, 0.8)
             << "\n  90%: " << quantile(var, 0.9)
+            << "\n  95%: " << quantile(var, 0.95)
             << "\n  99%: " << quantile(var, 0.99)
             << "\n99.9%: " << quantile(var, 0.999)
             << "\n-----------------------------\n";
@@ -193,15 +199,30 @@ int main(int argc, char const* argv[]) {
   auto const l = osr::lookup{w, opt.data_dir_, cista::mmap::protection::READ};
   auto const elevations = elevation_storage::try_open(opt.data_dir_);
 
+  if (opt.cch_ &&
+      !cch::usable(w, search_profile::kCar, nullptr, nullptr, nullptr)) {
+    fmt::println("CCH topology is missing or invalid; extract the map again");
+    return 1;
+  }
+
+  if (opt.cch_) {
+    fmt::println(
+        "OSR: {} nodes, {} ways; pinned matches; customization and matching "
+        "excluded; reconstruction included",
+        w.n_nodes(), w.n_ways());
+  }
   auto threads = std::vector<std::thread>(std::max(1U, opt.threads_));
   auto results = std::vector<benchmark_result>{};
+  auto baseline_results = std::vector<benchmark_result>{};
   results.reserve(opt.n_queries_);
+  baseline_results.reserve(opt.n_queries_);
 
   auto const run_benchmark = [&]<Profile P>(
                                  typename P::parameters const& params,
                                  search_profile const profile,
                                  const char* profile_label) {
     results.clear();
+    baseline_results.clear();
     auto i = std::atomic_size_t{0U};
     auto m = std::mutex{};
     for (auto& t : threads) {
@@ -210,7 +231,8 @@ int main(int argc, char const* argv[]) {
         auto b = bidirectional<P>{};
         auto h = cista::BASE_HASH;
         auto n = 0U;
-        while (i.fetch_add(1U) < opt.n_queries_ - 1) {
+        auto warmed = false;
+        while (i.fetch_add(1U) < opt.n_queries_) {
           auto const start =
               node_idx_t{cista::hash_combine(h, ++n, i.load()) % w.n_nodes()};
           auto const end =
@@ -224,33 +246,63 @@ int main(int argc, char const* argv[]) {
               location{w.get_node_pos(start).as_latlng(), level_t{0.F}};
           auto const end_loc =
               location{w.get_node_pos(end).as_latlng(), level_t{0.F}};
-          if (opt.from_coords_) {
+          if (opt.from_coords_ || opt.cch_) {
+            auto start_match = match_t{};
+            auto end_match = match_t{};
+            if (opt.cch_) {
+              if (geo::distance(start_loc.pos_, end_loc.pos_) < 8.0) {
+                continue;
+              }
+              auto const match = [&](location const& loc, node_idx_t const node,
+                                     bool const reverse) {
+                auto m = l.match<P>(params, loc, reverse, direction::kForward,
+                                    100, nullptr);
+                std::erase_if(m, [&](auto const& wc) {
+                  return wc.left_.node_ != node && wc.right_.node_ != node;
+                });
+                if (m.size() > 1U) {
+                  m.resize(1U);
+                }
+                return m;
+              };
+              start_match = match(start_loc, start, false);
+              end_match = match(end_loc, end, true);
+              if (start_match.empty() || end_match.empty()) {
+                continue;
+              }
+            }
+            auto const query = [&](routing_algorithm const algo) {
+              return opt.cch_ ? route(params, w, l, profile, start_loc, end_loc,
+                                      start_match, end_match, opt.max_dist_,
+                                      direction::kForward, nullptr, nullptr,
+                                      nullptr, algo)
+                              : route(params, w, l, profile, start_loc, end_loc,
+                                      opt.max_dist_, direction::kForward, 250,
+                                      nullptr, nullptr, nullptr, algo);
+            };
+            if (opt.cch_ && !warmed) {
+              query(routing_algorithm::kDijkstra);
+              query(routing_algorithm::kCCH);
+              warmed = true;
+            }
             auto const start_time = std::chrono::steady_clock::now();
-            auto const d_res =
-                route(params, w, l, profile, start_loc, end_loc, opt.max_dist_,
-                      direction::kForward, 250, nullptr, nullptr, nullptr,
-                      routing_algorithm::kDijkstra);
+            auto const d_res = query(routing_algorithm::kDijkstra);
             auto const middle_time = std::chrono::steady_clock::now();
-            auto const b_res =
-                route(params, w, l, profile, start_loc, end_loc, opt.max_dist_,
-                      direction::kForward, 250, nullptr, nullptr, nullptr,
-                      routing_algorithm::kAStarBi);
+            auto const b_res = query(opt.cch_ ? routing_algorithm::kCCH
+                                              : routing_algorithm::kAStarBi);
             auto const end_time = std::chrono::steady_clock::now();
-
-            /*std::cout << "took "
-                      << std::chrono::duration_cast<std::chrono::milliseconds>(
-                             middle_time - start_time)
-                      << " vs "
-                      << std::chrono::duration_cast<std::chrono::milliseconds>(
-                             end_time - middle_time)
-                      << std::endl;*/
 
             utl::verify(!d_res.has_value() && !b_res.has_value() ||
                             d_res.has_value() && b_res.has_value() &&
                                 d_res->cost_ == b_res->cost_,
-                        "not equal {} {}", d_res->cost_, b_res->cost_);
+                        "not equal {} {}", d_res ? d_res->cost_ : kInfeasible,
+                        b_res ? b_res->cost_ : kInfeasible);
             {
               auto const guard = std::lock_guard{m};
+              baseline_results.emplace_back(
+                  benchmark_result{std::chrono::duration_cast<
+                      decltype(benchmark_result::duration_)>(middle_time -
+                                                             start_time)});
               results.emplace_back(benchmark_result{std::chrono::duration_cast<
                   decltype(benchmark_result::duration_)>(end_time -
                                                          middle_time)});
@@ -276,13 +328,6 @@ int main(int argc, char const* argv[]) {
                 params, w, *w.r_, opt.max_dist_, nullptr, nullptr,
                 elevations.get());
             auto const end_time = std::chrono::steady_clock::now();
-            /*std::cout << "took "
-                      << std::chrono::duration_cast<std::chrono::milliseconds>(
-                             middle_time - start_time)
-                      << " vs "
-                      << std::chrono::duration_cast<std::chrono::milliseconds>(
-                             end_time - middle_time)
-                      << std::endl;*/
             auto const b_res =
                 b.get_cost_to_mp(b.meet_point_1_, b.meet_point_2_);
             if (!utl::any_of(ends, [&](auto&& e) {
@@ -312,8 +357,17 @@ int main(int argc, char const* argv[]) {
     std::ranges::sort(results, std::less<>{}, [](benchmark_result const& res) {
       return res.duration_;
     });
+    std::ranges::sort(
+        baseline_results, std::less<>{},
+        [](benchmark_result const& res) { return res.duration_; });
 
-    print_result(results, profile_label);
+    if (!baseline_results.empty()) {
+      print_result(baseline_results, fmt::format("{} dijkstra", profile_label));
+      print_result(results, fmt::format("{} {}", profile_label,
+                                        opt.cch_ ? "cch" : "bidirectional"));
+    } else {
+      print_result(results, profile_label);
+    }
   };
 
   auto const run_speed_benchmark = [&](search_profile const profile,
@@ -333,11 +387,16 @@ int main(int argc, char const* argv[]) {
   };
   auto const walk_speed = opt.speed_;
   auto const bike_speed = 3.5F * walk_speed;
-  run_speed_benchmark(search_profile::kFoot, "foot", walk_speed);
-  run_speed_benchmark(search_profile::kCar, "car");
-  run_speed_benchmark(search_profile::kBike, "bike", bike_speed);
-  run_speed_benchmark(search_profile::kBikeElevationLow,
-                      "bike (low elevation costs)", bike_speed);
-  run_speed_benchmark(search_profile::kBikeElevationHigh,
-                      "bike (high elevation costs)", bike_speed);
+  if (opt.cch_) {
+    run_speed_benchmark(search_profile::kCar, "car");
+    run_speed_benchmark(search_profile::kBus, "bus");
+  } else {
+    run_speed_benchmark(search_profile::kFoot, "foot", walk_speed);
+    run_speed_benchmark(search_profile::kCar, "car");
+    run_speed_benchmark(search_profile::kBike, "bike", bike_speed);
+    run_speed_benchmark(search_profile::kBikeElevationLow,
+                        "bike (low elevation costs)", bike_speed);
+    run_speed_benchmark(search_profile::kBikeElevationHigh,
+                        "bike (high elevation costs)", bike_speed);
+  }
 }

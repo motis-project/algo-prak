@@ -9,6 +9,7 @@
 #include <sys/mman.h>
 #endif
 #include <filesystem>
+#include <memory>
 #include <ranges>
 
 #include "fmt/ranges.h"
@@ -33,6 +34,9 @@
 #include "osr/util/multi_counter.h"
 
 namespace osr {
+namespace cch {
+struct cache;
+}
 
 struct resolved_restriction {
   enum class type { kNo, kOnly } type_;
@@ -196,6 +200,9 @@ static_assert(sizeof(node_properties) == 3);
 
 struct ways {
   ways(std::filesystem::path, cista::mmap::protection);
+  ~ways();
+  ways(ways&&) noexcept;
+  ways& operator=(ways&&) noexcept;
 
   void add_restriction(std::vector<resolved_restriction>&);
   void compute_big_street_neighbors();
@@ -379,6 +386,7 @@ struct ways {
   };
 
   cista::wrapped<routing> r_;
+  std::unique_ptr<cch::cache> cch_;
 
   mm_vec_map<node_idx_t, osm_node_idx_t> node_to_osm_;
   mm_vec_map<way_idx_t, osm_way_idx_t> way_osm_idx_;
