@@ -5,8 +5,16 @@
 /.clang-tidy
 /.vs
 /out
+.DS_Store
+/.vscode
 *.pbf
 test/monaco
 test/hamburg
 test/switzerland
 test/germany
+test/aachen
+test/darmstadt-bismarckstr
+test/karlsruhe-kirchfeld
+test/switzerland-latest
+results
+results_2

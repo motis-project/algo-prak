@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <algorithm>
+#include <iostream>
 #include <optional>
 
 #include "boost/thread/tss.hpp"
@@ -15,6 +16,7 @@
 #include "osr/elevation_storage.h"
 #include "osr/lookup.h"
 #include "osr/routing/bidirectional.h"
+#include "osr/routing/cch_bidirectional_dijkstra.h"
 #include "osr/routing/dijkstra.h"
 #include "osr/routing/path_reconstruction.h"
 #include "osr/routing/profiles/bike.h"
@@ -51,12 +53,201 @@ dijkstra<P>& get_dijkstra() {
   return *s.get();
 }
 
+template <Profile P>
+cch::bidir_dijkstra<P>& get_bidir_dijkstra() {
+  static auto s = boost::thread_specific_ptr<cch::bidir_dijkstra<P>>{};
+  if (s.get() == nullptr) {
+    s.reset(new cch::bidir_dijkstra<P>{});
+  }
+  return *s.get();
+}
+
 routing_algorithm to_algorithm(std::string_view s) {
   switch (cista::hash(s)) {
     case cista::hash("dijkstra"): return routing_algorithm::kDijkstra;
     case cista::hash("bidirectional"): return routing_algorithm::kAStarBi;
+    case cista::hash("bidir_dijkstra"):
+      return routing_algorithm::kBidirDijkstra;
   }
   throw utl::fail("unknown routing algorithm: {}", s);
+}
+
+// Path reconstruction for the cch bidir search.
+// Between each forward_n and pred, a shortcut is unpacked to recreate the path.
+// General Structure is inspired by the path reconstruction of the a-star bidir
+// search
+template <Profile P>
+path reconstruct_bidir(typename P::parameters const& params,
+                       ways const& w,
+                       lookup const& l,
+                       bitvec<node_idx_t> const* blocked,
+                       sharing_data const* sharing,
+                       elevation_storage const* elevations,
+                       cch::bidir_dijkstra<P> const& b,
+                       location const& from,
+                       location const& to,
+                       way_candidate const& start,
+                       way_candidate const& dest,
+                       direction const dir) {
+  auto forward_n = b.meet_point_f_;
+  auto forward_segments = std::vector<path::segment>{};
+  auto forward_dist = 0.0;
+
+  while (true) {
+    auto const& entry = b.cost_f_.at(forward_n.get_key());
+    auto const shortcut_entry_fw = entry.pred(forward_n);
+    if (shortcut_entry_fw.has_value()) {
+      auto const sc_start = std::move(*shortcut_entry_fw);
+      auto const& shortcut = w.r_->get_packed_shortcut<true>(
+          sc_start.n_, forward_n.way_, forward_n.dir_, forward_n.n_);
+      auto const path =
+          dir == direction::kForward
+              ? w.r_->unpack_shortcut<direction::kForward, true>(shortcut)
+              : w.r_->unpack_shortcut<direction::kBackward, true>(shortcut);
+      if (path.size() > 1) {
+        for (std::uint32_t i = (path.size() - 1); i > 0; --i) {
+          auto pred = typename P::node{path[i - 1].n_, path[i - 1].way_,
+                                       path[i - 1].dir_};
+          auto step_cost =
+              w.r_->get_edge_cost<true>(pred.n_, pred.way_, pred.dir_,
+                                        forward_n.n_, params.uturn_penalty_);
+          forward_dist +=
+              add_path<P>(params, w, *w.r_, blocked, sharing, elevations, pred,
+                          forward_n, step_cost, forward_segments, dir);
+          forward_n = pred;
+        }
+      }
+
+      auto step_cost =
+          w.r_->get_edge_cost<true>(sc_start.n_, sc_start.way_, sc_start.dir_,
+                                    forward_n.n_, params.uturn_penalty_);
+      utl::verify(sc_start.n_ == shortcut.entry_node_.n_,
+                  "[PATH REC FW] Sc start did not match shortcut entry node");
+
+      forward_dist +=
+          add_path<P>(params, w, *w.r_, blocked, sharing, elevations, sc_start,
+                      forward_n, step_cost, forward_segments, dir);
+      forward_n = sc_start;
+    } else {
+      break;
+    }
+  }
+
+  auto const& start_node_candidate =
+      forward_n.get_node() == start.left_.node_ ? start.left_ : start.right_;
+
+  forward_segments.push_back(
+      {.polyline_ =
+           l.get_node_candidate_path(start, start_node_candidate, false, from),
+       .from_level_ = start_node_candidate.lvl_,
+       .to_level_ = start_node_candidate.lvl_,
+       .from_ = dir == direction::kBackward ? forward_n.get_node()
+                                            : node_idx_t::invalid(),
+       .to_ = dir == direction::kForward ? forward_n.get_node()
+                                         : node_idx_t::invalid(),
+       .way_ = way_idx_t::invalid(),
+       .cost_ = start_node_candidate.cost_,
+       .dist_ = static_cast<distance_t>(start_node_candidate.dist_to_node_),
+       .mode_ = forward_n.get_mode()});
+
+  auto backward_segments = std::vector<path::segment>{};
+  auto backward_n = b.meet_point_b_;
+  auto backward_dist = 0.0;
+
+  while (true) {
+    auto const& entry = b.cost_b_.at(backward_n.get_key());
+    auto const shortcut_entry_bw = entry.pred(backward_n);
+    if (shortcut_entry_bw.has_value()) {
+      auto const sc_start = std::move(*shortcut_entry_bw);
+      auto const& shortcut = w.r_->get_packed_shortcut<false>(
+          sc_start.n_, backward_n.way_, backward_n.dir_, backward_n.n_);
+      auto path =
+          dir == direction::kForward
+              ? w.r_->unpack_shortcut<direction::kBackward, false>(shortcut)
+              : w.r_->unpack_shortcut<direction::kForward, false>(shortcut);
+      std::reverse(path.begin(), path.end());
+      if (path.size() > 1) {
+        for (std::uint32_t i = (path.size() - 1); i > 0; --i) {
+          auto pred = typename P::node{path[i - 1].n_, path[i - 1].way_,
+                                       path[i - 1].dir_};
+          auto step_cost =
+              w.r_->get_edge_cost<false>(pred.n_, pred.way_, pred.dir_,
+                                         backward_n.n_, params.uturn_penalty_);
+          backward_dist += add_path<P>(params, w, *w.r_, blocked, sharing,
+                                       elevations, pred, backward_n, step_cost,
+                                       backward_segments, opposite(dir));
+          backward_n = pred;
+        }
+      }
+
+      auto step_cost =
+          w.r_->get_edge_cost<false>(sc_start.n_, sc_start.way_, sc_start.dir_,
+                                     backward_n.n_, params.uturn_penalty_);
+      utl::verify(sc_start.n_ == shortcut.exit_node_.n_,
+                  "[PATH REC BW] Sc start did not match shortcut entry node");
+
+      backward_dist +=
+          add_path<P>(params, w, *w.r_, blocked, sharing, elevations, sc_start,
+                      backward_n, step_cost, backward_segments, opposite(dir));
+      backward_n = sc_start;
+    } else {
+      break;
+    }
+  }
+
+  auto const& dest_node_candidate =
+      backward_n.get_node() == dest.left_.node_ ? dest.left_ : dest.right_;
+
+  backward_segments.push_back(
+      {.polyline_ =
+           l.get_node_candidate_path(dest, dest_node_candidate, true, to),
+       .from_level_ = dest_node_candidate.lvl_,
+       .to_level_ = dest_node_candidate.lvl_,
+       .from_ = dir == direction::kForward ? backward_n.get_node()
+                                           : node_idx_t::invalid(),
+       .to_ = dir == direction::kBackward ? backward_n.get_node()
+                                          : node_idx_t::invalid(),
+       .way_ = way_idx_t::invalid(),
+       .cost_ = dest_node_candidate.cost_,
+       .dist_ = static_cast<distance_t>(dest_node_candidate.dist_to_node_),
+       .mode_ = backward_n.get_mode()});
+
+  if (dir == direction::kForward) {
+    std::reverse(forward_segments.begin(), forward_segments.end());
+  } else {
+    std::reverse(backward_segments.begin(), backward_segments.end());
+  }
+  forward_segments.insert(forward_segments.end(), backward_segments.begin(),
+                          backward_segments.end());
+
+  auto total_dist = start_node_candidate.dist_to_node_ + forward_dist +
+                    backward_dist + dest_node_candidate.dist_to_node_;
+
+  auto path_elevation = elevation_storage::elevation{};
+  for (auto const& segment : forward_segments) {
+    path_elevation += segment.elevation_;
+  }
+  // I used [AI] here to let me explain an error message when calling
+  // b.get_cost<dir>(...). It stated that it must be b.template
+  // get_cost<dir>(...) to be usable.
+  auto const final_cost_fw =
+      b.template get_cost<direction::kForward>(b.meet_point_f_);
+  auto const final_cost_bw =
+      b.template get_cost<direction::kBackward>(b.meet_point_b_);
+  auto penalty = (b.meet_point_f_.way_ == b.meet_point_b_.way_ &&
+                  b.meet_point_f_.dir_ == opposite(b.meet_point_b_.dir_))
+                     ? params.uturn_penalty_
+                     : cost_t{0U};
+
+  auto const total = static_cast<std::uint64_t>(final_cost_fw) +
+                     static_cast<std::uint64_t>(final_cost_bw) + penalty;
+  auto p = path{.cost_ = static_cast<cost_t>(total),
+                .dist_ = total_dist,
+                .elevation_ = path_elevation,
+                .segments_ = forward_segments};
+
+  b.cost_b_.at(backward_n.get_key()).write(backward_n, p);
+  return p;
 }
 
 template <Profile P>
@@ -392,14 +583,16 @@ std::optional<path> route_bidirectional(typename P::parameters const& params,
     if (b.max_reached_1_ && component_seen(w, from_match, i)) {
       continue;
     }
-    auto const start_way = start.way_;
+
     for (auto const* nc : {&start.left_, &start.right_}) {
       if (nc->valid() && nc->cost_ < max) {
         P::resolve_start_node(
             *w.r_, start.way_, nc->node_, from.lvl_, dir, [&](auto const node) {
               auto label = typename P::label{node, nc->cost_};
-              label.track(label, *w.r_, start_way, node.get_node(), false);
-              b.add_start(params, w, label, sharing);
+              label.track(label, *w.r_, start.way_, node.get_node(), false);
+              b.add_start(
+                  params, w, label,
+                  sharing);  // add start nodes here and the previous lines
             });
       }
     }
@@ -417,15 +610,15 @@ std::optional<path> route_bidirectional(typename P::parameters const& params,
           j > kBottomKDefinitelyConsidered) {
         break;
       }
-      auto const end_way = end.way_;
+
       for (auto const* nc : {&end.left_, &end.right_}) {
         if (nc->valid() && nc->cost_ < max) {
           P::resolve_start_node(
-              *w.r_, end_way, nc->node_, to.lvl_, opposite(dir),
+              *w.r_, end.way_, nc->node_, to.lvl_, opposite(dir),
               [&](auto const node) {
                 auto label = typename P::label{node, nc->cost_};
-                label.track(label, *w.r_, end_way, node.get_node(), false);
-                b.add_end(params, w, label, sharing);
+                label.track(label, *w.r_, end.way_, node.get_node(), false);
+                b.add_end(params, w, label, sharing);  // add end nodes
               });
         }
       }
@@ -456,19 +649,21 @@ std::optional<path> route_bidirectional(typename P::parameters const& params,
 }
 
 template <Profile P>
-std::optional<path> route_dijkstra(typename P::parameters const& params,
-                                   ways const& w,
-                                   lookup const& l,
-                                   dijkstra<P>& d,
-                                   location const& from,
-                                   location const& to,
-                                   match_view_t from_match,
-                                   match_view_t to_match,
-                                   cost_t const max,
-                                   direction const dir,
-                                   bitvec<node_idx_t> const* blocked,
-                                   sharing_data const* sharing,
-                                   elevation_storage const* elevations) {
+std::optional<path> route_dijkstra(
+    typename P::parameters const& params,
+    ways const& w,
+    lookup const& l,
+    dijkstra<P>& d,
+    location const& from,
+    location const& to,
+    match_view_t from_match,  // array of way candidates with two closest nodes
+                              // left and right
+    match_view_t to_match,
+    cost_t const max,
+    direction const dir,
+    bitvec<node_idx_t> const* blocked,
+    sharing_data const* sharing,
+    elevation_storage const* elevations) {
   if (auto const direct = try_direct(from, to); direct.has_value()) {
     return *direct;
   }
@@ -516,6 +711,86 @@ std::optional<path> route_dijkstra(typename P::parameters const& params,
     }
   }
 
+  return std::nullopt;
+}
+
+template <Profile P>
+std::optional<path> route_cch_bidir_dijkstra(
+    typename P::parameters const& params,
+    ways const& w,
+    lookup const& l,
+    cch::bidir_dijkstra<P>& b,
+    location const& from,
+    location const& to,
+    match_view_t from_match,
+    match_view_t to_match,
+    cost_t const max,
+    direction const dir,
+    bitvec<node_idx_t> const* blocked,
+    sharing_data const* sharing,
+    elevation_storage const* elevations) {
+  if (auto const direct = try_direct(from, to); direct.has_value()) {
+    return *direct;
+  }
+
+  b.reset(max, from, to);
+
+  auto should_continue = true;  // add the start nodes to the forward queue:
+  for (auto const [i, start] : utl::enumerate(from_match)) {
+    if (!should_continue && component_seen(w, from_match, i)) {
+      continue;
+    }
+
+    for (auto const* nc : {&start.left_, &start.right_}) {
+      if (nc->valid() && nc->cost_ < max) {
+        P::resolve_start_node(
+            *w.r_, start.way_, nc->node_, from.lvl_, dir,
+            [&](auto const node) { b.add_start(w, {node, nc->cost_}); });
+      }
+    }
+    if (b.pq_f_.empty()) {
+      continue;
+    }
+    for (auto const [j, end] : utl::enumerate(to_match)) {
+      if (w.r_->way_component_[start.way_] != w.r_->way_component_[end.way_]) {
+        continue;
+      }
+      if (!should_continue && component_seen(w, to_match, j)) {
+        continue;
+      }
+
+      for (auto const* nc :
+           {&end.left_,
+            &end.right_}) {  // add destination candidates for backward queue
+        if (nc->valid() && nc->cost_ < max) {
+          P::resolve_start_node(
+              *w.r_, end.way_, nc->node_, to.lvl_, opposite(dir),
+              [&](auto const node) { b.add_end(w, {node, nc->cost_}); });
+        }
+      }
+      if (b.pq_b_.empty()) {
+        continue;
+      }
+
+      should_continue =
+          b.run(params, w, *w.r_, max, blocked, sharing, elevations, dir);
+
+      // check if a mu was already found:
+      if (b.meet_point_f_.get_node() == node_idx_t::invalid() &&
+          b.meet_point_b_.get_node() == node_idx_t::invalid()) {
+        if (should_continue) {
+          continue;
+        } else {
+          return std::nullopt;
+        }
+      }
+
+      // reconstruct the path:
+      return reconstruct_bidir<P>(params, w, l, blocked, sharing, elevations, b,
+                                  from, to, start, end, dir);
+    }
+  }
+  // std::cout << "TERMINATED: Exceeded Matches\n";
   return std::nullopt;
 }
 
@@ -663,6 +938,8 @@ std::vector<std::optional<path>> route(
       });
 }
 
+// before starting the dijkstra create the from and two matches here or stop the
+// process
 std::optional<path> route_dijkstra(profile_parameters const& params,
                                    ways const& w,
                                    lookup const& l,
@@ -716,6 +993,37 @@ std::vector<std::optional<path>> route(
   });
 }
 
+std::optional<path> route_cch_bidir_dijkstra(
+    profile_parameters const& params,
+    ways const& w,
+    lookup const& l,
+    search_profile const profile,
+    location const& from,
+    location const& to,
+    cost_t const max,
+    direction const dir,
+    double const max_match_distance,
+    bitvec<node_idx_t> const* blocked,
+    sharing_data const* sharing,
+    elevation_storage const* elevations) {
+  return with_valid_cch_profile(
+      profile, [&]<Profile P>(P&&) -> std::optional<path> {
+        auto const& pp = std::get<typename P::parameters>(params);
+        auto const from_match =
+            l.match<P>(pp, from, false, dir, max_match_distance, blocked);
+        auto const to_match =
+            l.match<P>(pp, to, true, dir, max_match_distance, blocked);
+
+        if (from_match.empty() || to_match.empty()) {
+          return std::nullopt;
+        }
+
+        return route_cch_bidir_dijkstra(pp, w, l, get_bidir_dijkstra<P>(), from,
+                                        to, from_match, to_match, max, dir,
+                                        blocked, sharing, elevations);
+      });
+}
+
 std::optional<path> route(profile_parameters const& params,
                           ways const& w,
                           lookup const& l,
@@ -753,6 +1061,17 @@ std::optional<path> route(profile_parameters const& params,
                                    from_match, to_match, max, dir, blocked,
                                    sharing, elevations);
       });
+    case routing_algorithm::kBidirDijkstra:
+      // run into weird error message here, by using "with_profile" for my
+      // algorithm. I used [AI] to let me explain the occured error message. Its
+      // recommendation was to use a separate function which I developed myself
+      // after the hint.
+      return with_valid_cch_profile(profile, [&]<Profile P>(P&&) {
+        return route_cch_bidir_dijkstra(
+            std::get<typename P::parameters>(params), w, l,
+            get_bidir_dijkstra<P>(), from, to, from_match, to_match, max, dir,
+            blocked, sharing, elevations);
+      });
   }
   throw utl::fail("not implemented");
 }
@@ -784,6 +1103,10 @@ std::optional<path> route(profile_parameters const& params,
       return route_bidirectional(params, w, l, profile, from, to, max, dir,
                                  max_match_distance, blocked, sharing,
                                  elevations);
+    case routing_algorithm::kBidirDijkstra:
+      return route_cch_bidir_dijkstra(params, w, l, profile, from, to, max, dir,
+                                      max_match_distance, blocked, sharing,
+                                      elevations);
   }
   throw utl::fail("not implemented");
 }

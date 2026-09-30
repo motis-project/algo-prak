@@ -5,6 +5,7 @@ namespace osr {
 void extract(bool with_platforms,
              std::filesystem::path const& in,
              std::filesystem::path const& out,
-             std::filesystem::path const& elevation_dir);
+             std::filesystem::path const& elevation_dir,
+             bool const with_cch = false);
 
 }  // namespace osr

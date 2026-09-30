@@ -175,7 +175,9 @@ void for_each_adjacent_node(typename P::parameters const& params,
     };
 
     if (i != 0U) {
-      expand(flip<SearchDir>(direction::kBackward), i, i - 1);
+      expand(flip<SearchDir>(direction::kBackward), i,
+             i - 1);  // nutze flip, um egal, was SearchDir ist, auf jeden Fall
+                      // kBackward zu erhalten
     }
     if (i != w.way_nodes_[way].size() - 1U) {
       expand(flip<SearchDir>(direction::kForward), i, i + 1);

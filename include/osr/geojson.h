@@ -201,6 +201,11 @@ struct geojson_writer {
           {"bike", p.is_bike_accessible()},
           {"foot", p.is_walk_accessible()},
           {"importance", w_.r_->node_importance_[n]},
+          {"upper neighbors",
+           fmt::format("{}", w_.r_->sc_targets_[w_.r_->node_importance_[n]] |
+                                 std::views::transform([&](auto&& w) {
+                                   return to_idx(w_.node_to_osm_[w]);
+                                 }))},
           {"bus", p.is_bus_accessible()},
           {"bus_with_penalty", p.is_bus_accessible_with_penalty()},
           {"is_restricted", w_.r_->node_is_restricted_[n]},

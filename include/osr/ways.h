@@ -29,6 +29,7 @@
 
 #include "osr/point.h"
 #include "osr/routing/turns.h"
+#include "osr/shortcut.h"
 #include "osr/types.h"
 #include "osr/util/multi_counter.h"
 
@@ -201,7 +202,7 @@ struct ways {
   void compute_big_street_neighbors();
   void connect_ways();
   void compute_turn_bearings();
-  void build_components_and_importance();
+  void build_components_and_importance(bool const with_cch);
 
   std::optional<way_idx_t> find_way(osm_way_idx_t const i) {
     auto const it = std::lower_bound(begin(way_osm_idx_), end(way_osm_idx_), i);
@@ -344,6 +345,157 @@ struct ways {
                                  node_turn_bearings_[n][to], to_dir);
     }
 
+    // return the shortcut between the virtual node from and the node to
+    template <bool IsUp>
+    cch::packed_shortcut get_packed_shortcut(node_idx_t const& from,
+                                             way_pos_t const& to_way,
+                                             direction const& to_dir,
+                                             node_idx_t const& to) const {
+      auto const& from_rank = node_importance_[from];
+      if (from != to) {
+        auto const t_idx = get_target_idx(from, to);
+        return IsUp ? cch_sc_up_[from_rank][t_idx]
+                    : cch_sc_down_[from_rank][t_idx];
+      } else {
+        for (auto const sc : cch_sc_self_[from_rank]) {
+          auto const& e = IsUp ? sc.exit_node_ : sc.entry_node_;
+          if (e.n_ == to && e.way_ == to_way && e.dir_ == to_dir) {
+            return sc;
+          }
+        }
+        return cch::packed_shortcut::invalid();
+        throw utl::fail("[GET PACKED SHORTCUT] Got no matching self shorcut");
+      }
+    }
+
+    // return the index of a target (upper neighbor) in from
+    std::uint32_t get_target_idx(node_idx_t const& from,
+                                 node_idx_t const& to) const {
+      auto const& from_rank = node_importance_[from];
+      for (auto const [idx, target] : utl::enumerate(sc_targets_[from_rank])) {
+        if (to == target) {
+          return static_cast<std::uint32_t>(idx);
+          return static_cast<std::uint32_t>(idx);
+        }
+      }
+      throw utl::fail("Node {} has not target {}", from, to);
+    }
+
+    // after unpacking the shortcut path return the edge cost for
+    // specific edge in the path.
+    template <bool IsUp>
+    cost_t get_edge_cost(node_idx_t const& from,
+                         way_pos_t const& from_way,
+                         direction const& from_dir,
+                         node_idx_t const& to,
+                         cost_t const& penalty) const {
+      auto const& from_rank = node_importance_[from];
+      auto const& to_rank = node_importance_[to];
+
+      if (from_rank < to_rank) {
+        auto const& shortcut =
+            IsUp ? get_packed_shortcut<true>(from, from_way, from_dir, to)
+                 : get_packed_shortcut<false>(from, from_way, from_dir, to);
+        utl::verify(cch_true_edge(shortcut),
+                    "[EDGE COST 1] Try to get cost of unreal edge");
+        auto const t_idx = get_target_idx(from, to);
+        auto cost = IsUp ? cch_cost_up_[from_rank][t_idx]
+                         : cch_cost_down_[from_rank][t_idx];
+        utl::verify(cost != osr::kInfeasible,
+                    "[EDGE COST 2] Try to get unreal cost");
+        auto const& tp = IsUp ? shortcut.entry_node_ : shortcut.exit_node_;
+        utl::verify(tp.n_ == from, "[EDGE COST 3] Invalid touching point");
+        if (from_way == tp.way_ && from_dir == opposite(tp.dir_)) {
+          cost += penalty;
+        }
+        return cost;
+      }
+
+      if (to_rank < from_rank) {
+        auto const& shortcut =
+            IsUp ? get_packed_shortcut<false>(to, from_way, from_dir, from)
+                 : get_packed_shortcut<true>(to, from_way, from_dir, from);
+        utl::verify(cch_true_edge(shortcut),
+                    "[EDGE COST 4] Try to get cost of unreal edge");
+        auto const t_idx = get_target_idx(to, from);
+        auto cost = IsUp ? cch_cost_down_[to_rank][t_idx]
+                         : cch_cost_up_[to_rank][t_idx];
+        utl::verify(cost != osr::kInfeasible,
+                    "[EDGE COST 5] Try to get unreal cost");
+        auto const& tp = IsUp ? shortcut.entry_node_ : shortcut.exit_node_;
+        utl::verify(tp.n_ == from, "[EDGE COST 6] Invalid touching point");
+        if (from_way == tp.way_ && from_dir == opposite(tp.dir_)) {
+          cost += penalty;
+        }
+        return cost;
+      }
+      throw utl::fail("Tried to get edge cost node to node");
+    }
+
+    // check if the shortcut consists of one (true) or multiple edges (false)
+    bool cch_true_edge(cch::packed_shortcut const& sc) const {
+      utl::verify(
+          sc.is_valid(),
+          "[CCH EDGE CHECK] Got invalid Shortcut in path. Failed unpacking");
+
+      if (sc.down_ == 0U && sc.up_ == 0U && sc.via_rank_ == 0U &&
+          sc.u_turn_penalty_ == cost_t{0U}) {
+        return true;
+      }
+
+      return false;
+    }
+
+    // unpack a shortcut recursively here:
+    template <direction PathDir, bool IsUp>
+    osr::vec<cch::target_node> unpack_shortcut(
+        cch::packed_shortcut const& sc) const {
+      auto const is_fwd = PathDir == direction::kForward;
+
+      // checke ob der shortcut eine echte Kante ist:
+      if (cch_true_edge(sc)) {
+        osr::vec<cch::target_node> unpacked_sc = {};
+        auto const& entry_rank = IsUp ? node_importance_[sc.entry_node_.n_]
+                                      : node_importance_[sc.exit_node_.n_];
+        auto const& target_idx =
+            IsUp ? get_target_idx(sc.entry_node_.n_, sc.exit_node_.n_)
+                 : get_target_idx(sc.exit_node_.n_, sc.entry_node_.n_);
+        auto const& edge_cost = IsUp ? cch_cost_up_[entry_rank][target_idx]
+                                     : cch_cost_down_[entry_rank][target_idx];
+        utl::verify(edge_cost != osr::kInfeasible,
+                    "[unpack shortcut] found invalid costs during unpacking");
+
+        if (is_fwd) {
+          unpacked_sc.push_back(sc.exit_node_);
+        } else {
+          unpacked_sc.push_back(sc.entry_node_);
+        }
+
+        return unpacked_sc;
+      }
+
+      // Falls keine direkte Kante, entpacke rekursiv weiter
+      auto const& to_target = IsUp ? cch_sc_up_[sc.via_rank_][sc.up_]
+                                   : cch_sc_down_[sc.via_rank_][sc.down_];
+      auto const& to_via = IsUp ? cch_sc_down_[sc.via_rank_][sc.down_]
+                                : cch_sc_up_[sc.via_rank_][sc.up_];
+
+      auto unpacked_to_target = this->unpack_shortcut<PathDir, IsUp>(to_target);
+      auto unpacked_to_via = this->unpack_shortcut<PathDir, !IsUp>(to_via);
+
+      if constexpr (IsUp) {
+        unpacked_to_via.insert(unpacked_to_via.end(),
+                               unpacked_to_target.begin(),
+                               unpacked_to_target.end());
+      } else {
+        unpacked_to_target.insert(unpacked_to_target.end(),
+                                  unpacked_to_via.begin(),
+                                  unpacked_to_via.end());
+      }
+
+      return IsUp ? unpacked_to_via : unpacked_to_target;
+    }
+
     static cista::wrapped<routing> read(std::filesystem::path const&);
     void write(std::filesystem::path const&) const;
 
@@ -371,6 +523,16 @@ struct ways {
 
     vec_map<node_idx_t, point> node_positions_;
     vec_map<node_idx_t, std::uint32_t> node_importance_;
+
+    // CCH Relevant information stored in ways:
+    vec<vec<node_idx_t>> sc_targets_;
+    vec<node_idx_t> contraction_order_;
+    vec<vec<cch::packed_shortcut>> cch_sc_up_;
+    vec<vec<cch::packed_shortcut>> cch_sc_down_;
+    vec<vec<cch::packed_shortcut>> cch_sc_self_;
+    vec<vec<cost_t>> cch_cost_up_;
+    vec<vec<cost_t>> cch_cost_down_;
+    vec<vec<cost_t>> cch_cost_self_;
 
     vec<pair<node_idx_t, level_bits_t>> multi_level_elevators_;
 
