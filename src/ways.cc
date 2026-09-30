@@ -1,6 +1,7 @@
 #include "osr/ways.h"
 
 #include <algorithm>
+#include <thread>
 
 #include "utl/pairwise.h"
 #include "utl/parallel_for.h"
@@ -8,9 +9,13 @@
 #include "cista/io.h"
 
 // uncomment the following line to enable IFC
-// #define USE_INERTIAL_FLOW_CUT
+#define USE_INERTIAL_FLOW_CUT
 #ifdef USE_INERTIAL_FLOW_CUT
 #include "inertialflowcutter/run.h"
+#endif
+
+#if __has_include(<valgrind/valgrind.h>)
+#include <valgrind/valgrind.h>
 #endif
 
 namespace osr {
@@ -118,6 +123,12 @@ void ways::build_components_and_importance() {
   r_->way_importance_.clear();
 
 #ifdef USE_INERTIAL_FLOW_CUT
+#ifdef RUNNING_ON_VALGRIND  // skip IFC on Valgrind
+  if (RUNNING_ON_VALGRIND) {
+    return;
+  }
+#endif
+
   pt->status("Run inertial flow cutter").in_high(n_ways()).out_bounds(90, 91);
 
   auto v_tail = std::vector<unsigned>{};
@@ -129,7 +140,8 @@ void ways::build_components_and_importance() {
       v_head.push_back(b.v_);
     }
   }
-  auto const thread_count = 4;
+  auto const thread_count =
+      std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
   ifc::run_inertial_flow_cutter(
       thread_count, static_cast<int>(n_nodes()), v_head, v_tail,
       [&](int i) {
